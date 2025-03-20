@@ -255,6 +255,7 @@ class RAMCachedDataset(Dataset):
                             
                 except Exception as e:
                     print(f"Error prefetching index {idx}: {e}")
+                    torch.cuda.empty_cache()
                 
                 # Free up some CPU time
                 time.sleep(0.001)

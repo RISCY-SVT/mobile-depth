@@ -86,6 +86,6 @@ for i, rgb_file in enumerate(rgb_files[:5]):
     
     plt.tight_layout()
     plt.savefig(f"debug_vis/depth_analysis_{i+1}.png")
-    plt.close()
+    plt.close('all')  # Explicitly close all figures to avoid memory leaks
 
 print("Debug visualizations saved to 'debug_vis' directory")

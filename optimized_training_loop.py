@@ -90,7 +90,7 @@ class GPUMetrics:
         plt.legend()
         plt.grid(True)
         plt.savefig(os.path.join(plot_dir, 'gpu_memory.png'))
-        plt.close()
+        plt.close('all')  # Explicitly close all figures to prevent memory leaks
         
         # Create utilization plot if available
         if any(self.metrics['utilization']):
@@ -102,7 +102,7 @@ class GPUMetrics:
             plt.legend()
             plt.grid(True)
             plt.savefig(os.path.join(plot_dir, 'gpu_utilization.png'))
-            plt.close()
+            plt.close('all')  # Explicitly close all figures to prevent memory leaks
 
 def optimize_cuda_settings():
     """Apply optimized CUDA settings for faster training"""
@@ -142,6 +142,7 @@ def train_epoch_optimized(model, train_loader, criterion, optimizer, scaler, dev
     Returns:
         Average loss for the epoch
     """
+    torch.cuda.empty_cache()
     model.train()
     epoch_loss = 0
     epoch_start = time.time()
@@ -225,6 +226,9 @@ def train_epoch_optimized(model, train_loader, criterion, optimizer, scaler, dev
         # Reset gradients
         optimizer.zero_grad()
         
+        if batch_idx % 500 == 0:
+            torch.cuda.empty_cache()
+        
         backward_time = time.time() - backward_start
         backward_times.append(backward_time)
         
@@ -277,6 +281,8 @@ def train_epoch_optimized(model, train_loader, criterion, optimizer, scaler, dev
           f"Backward: {avg_backward_time:.3f}s, "
           f"Data: {avg_data_time:.3f}s")
     
+    torch.cuda.empty_cache()
+    
     return avg_loss
 
 class DataPrefetcher:
@@ -316,10 +322,13 @@ class DataPrefetcher:
 
 def validate_optimized_fixed(model, val_loader, criterion, device, output_dir=None, epoch=None):
     """Fixed validation function with proper CUDA synchronization and error handling"""
+    # Reset CUDA state
+    torch.cuda.empty_cache()
     model.eval()
     val_loss = 0
     abs_rel_error = 0
     rmse = 0
+    
     
     # Use prefetcher for faster data loading
     progress_bar = tqdm(desc="Validation", total=len(val_loader))
@@ -366,6 +375,7 @@ def validate_optimized_fixed(model, val_loader, criterion, device, output_dir=No
                     rmse += float(rmse_batch.item())
                 except Exception as e:
                     print(f"Warning: Error calculating metrics: {e}")
+                    torch.cuda.empty_cache()  # Free memory used during visualization
                     # Continue even if metrics calculation fails
                 
                 # Visualization (only for first batch)
@@ -374,6 +384,7 @@ def validate_optimized_fixed(model, val_loader, criterion, device, output_dir=No
                         save_visualization(rgb, depth_gt, depth_pred_solo, output_dir, epoch)
                     except Exception as e:
                         print(f"Warning: Error saving visualization: {e}")
+                        torch.cuda.empty_cache()  # Free memory used during visualization
                 
                 # Update progress bar
                 progress_bar.update(1)
@@ -383,6 +394,7 @@ def validate_optimized_fixed(model, val_loader, criterion, device, output_dir=No
                     batch = prefetcher.next()
                 except Exception as e:
                     print(f"Error getting next batch: {e}")
+                    torch.cuda.empty_cache()  # Free memory used during visualization
                     batch = None
                     
                 batch_idx += 1
@@ -393,6 +405,7 @@ def validate_optimized_fixed(model, val_loader, criterion, device, output_dir=No
                 
             except Exception as e:
                 print(f"Error in validation batch {batch_idx}: {e}")
+                torch.cuda.empty_cache()  # Free memory used during visualization
                 # Try to continue with next batch
                 try:
                     batch = prefetcher.next()
@@ -461,7 +474,8 @@ def save_visualization(rgb, depth_gt, depth_pred, output_dir, epoch):
     
     plt.tight_layout()
     plt.savefig(os.path.join(vis_dir, f'epoch_{epoch:03d}.png'), dpi=150)
-    plt.close()
+    plt.close('all')  # Explicitly close all figures to avoid memory leaks
+    torch.cuda.empty_cache()  # Free memory used during visualization
 
 def train_optimized(args, model, train_dataset, val_dataset):
     """Optimized training function with enhanced monitoring and performance"""
@@ -542,6 +556,7 @@ def train_optimized(args, model, train_dataset, val_dataset):
     
     # Main training loop
     for epoch in range(start_epoch, args.epochs):
+        torch.cuda.empty_cache()
         epoch_start_time = time.time()
         current_lr = optimizer.param_groups[0]['lr']
         
@@ -613,6 +628,7 @@ def train_optimized(args, model, train_dataset, val_dataset):
             scheduler.step(train_loss)
         
         # Save regular checkpoints
+        torch.cuda.empty_cache()
         if (epoch + 1) % args.save_freq == 0:
             checkpoint_path = os.path.join(output_dir, 'checkpoints', f'model_epoch_{epoch+1}.pth')
             torch.save({
