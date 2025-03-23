@@ -11,6 +11,12 @@ from fix_data_loader import FixedRAMCachedDataset, create_single_process_dataloa
 from optimized_data_loader import RAMCachedDataset
 from optimized_training_loop import train_optimized
 
+# torch.backends.cudnn.enabled = False
+
+# Настраиваем выделение памяти
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
+
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Optimized training for MobileDepth model on MidAir dataset')
