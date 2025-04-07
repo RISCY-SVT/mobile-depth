@@ -21,7 +21,7 @@ from depth_model import MobileDepth
 class TestDataset(Dataset):
     """Dataset for testing the depth model on MidAir test data"""
     def __init__(self, root_dir, dataset_type='Kite_test', environments=None, 
-                image_size=384, max_samples=None):
+                image_size=256, max_samples=None):
         """
         Initialize the test dataset
         
@@ -502,7 +502,7 @@ def create_depth_comparison_with_gt(model, root_dir, dataset_type, environment, 
     
     # Set up transformations
     transform = transforms.Compose([
-        transforms.Resize((384, 384)),
+        transforms.Resize((256, 256)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -525,7 +525,7 @@ def create_depth_comparison_with_gt(model, root_dir, dataset_type, environment, 
         
         # Load ground truth depth
         depth_img = Image.open(depth_file)
-        depth_img = depth_img.resize((384, 384), Image.NEAREST)
+        depth_img = depth_img.resize((256, 256), Image.NEAREST)
         depth_np = np.array(depth_img).astype(np.float32)
         
         # Normalize ground truth depth
@@ -607,7 +607,7 @@ def main():
                         help='Specific environments to test on (default: all)')
     
     # Test parameters
-    parser.add_argument('--image_size', type=int, default=384,
+    parser.add_argument('--image_size', type=int, default=256,
                         help='Image size for testing')
     parser.add_argument('--max_samples', type=int, default=None,
                         help='Maximum number of samples to use (for quick testing)')

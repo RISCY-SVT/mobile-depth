@@ -12,6 +12,8 @@ A high-performance implementation of a lightweight depth estimation model design
 - **High-Performance Training**: Optimized for systems with large RAM and multi-core CPUs
 - **Mixed Precision Support**: Accelerated training with FP16 operations
 - **Attention Mechanisms**: Spatial attention modules improve focus on relevant areas
+- **System Tests**: Comprehensive system benchmark tools to optimize for your hardware
+- **Dataset Viewer**: Interactive tool for exploring and visualizing the MidAir dataset
 
 ## Model Architecture
 

@@ -31,7 +31,7 @@ def load_model(model_path, device='cpu'):
     model = model.to(device)
     return model
 
-def convert_to_onnx(model, output_path, input_shape=(1, 3, 384, 384), device='cpu', dynamic=False):
+def convert_to_onnx(model, output_path, input_shape=(1, 3, 256, 256), device='cpu', dynamic=False):
     """Convert PyTorch model to ONNX format
     
     Args:
@@ -78,11 +78,26 @@ def convert_to_onnx(model, output_path, input_shape=(1, 3, 384, 384), device='cp
         verbose=False
     )
     
+    # torch.onnx.export(
+    # model,
+    # dummy_input,
+    # output_path,
+    # export_params=True,
+    # opset_version=11,
+    # do_constant_folding=True,
+    # input_names=["input"],
+    # output_names=["output"],
+    # dynamic_axes=None,  # Для статических размеров входа
+    # verbose=True
+    # )
+    
     print(f"ONNX model saved to: {output_path}")
     print("Verifying ONNX model...")
     
     # Verify the ONNX model
     try:
+        # If your IDE shows an error here but pip install shows it's installed,
+        # it's likely just an IDE configuration issue - the code will still run fine
         import onnx
         onnx_model = onnx.load(output_path)
         onnx.checker.check_model(onnx_model)
@@ -107,7 +122,7 @@ def convert_to_onnx(model, output_path, input_shape=(1, 3, 384, 384), device='cp
     
     return output_path
 
-def test_onnx_inference(onnx_path, input_shape=(1, 3, 384, 384)):
+def test_onnx_inference(onnx_path, input_shape=(1, 3, 256, 256)):
     """Test inference with the exported ONNX model
     
     Args:
@@ -294,7 +309,7 @@ def create_onnx_info_file(onnx_path, model_info, save_path=None):
         f.write("from PIL import Image\n")
         f.write("import numpy as np\n\n")
         f.write("# Load and preprocess image\n")
-        f.write("img = Image.open('image.jpg').convert('RGB').resize((384, 384))\n")
+        f.write("img = Image.open('image.jpg').convert('RGB').resize((256, 256))\n")
         f.write("img_np = np.array(img).astype(np.float32) / 255.0\n")
         f.write("# Normalize with ImageNet mean and std\n")
         f.write("mean = np.array([0.485, 0.456, 0.406])\n")
@@ -333,7 +348,7 @@ def main():
                         help="Path to save the ONNX model")
     
     # Conversion parameters
-    parser.add_argument("--input_size", type=int, default=384,
+    parser.add_argument("--input_size", type=int, default=256,
                         help="Input image size (assumed square)")
     parser.add_argument("--dynamic", action="store_true",
                         help="Use dynamic input size")
