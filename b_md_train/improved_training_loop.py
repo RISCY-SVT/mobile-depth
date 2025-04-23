@@ -1,6 +1,4 @@
-import os
-import time
-import datetime
+import os, time, datetime, json, math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,7 +10,6 @@ import matplotlib.pyplot as plt
 from threading import Thread
 import torch.nn.utils.prune as prune
 import logging
-import math
 
 from improved_depth_loss import MultiScaleLoss, DepthWithSmoothnessLoss, RobustLoss, BerHuLoss
 from improved_fix_data_loader import QATPrefetcher
@@ -115,7 +112,7 @@ class GPUMetrics:
 def optimize_cuda_settings():
     """Apply optimized CUDA settings for faster training"""
     # Set CUDA Backend to run with maximum performance
-    torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.benchmark = True
     # Enable TF32 precision for faster processing on newer GPUs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -130,6 +127,31 @@ def optimize_cuda_settings():
             logger.info("Process priority set to HIGH")
         except:
             logger.warning("Failed to set process priority")
+
+def dump_cuda_state(tag: str = "") -> None:
+    """
+    Сохраняет расширенную информацию о памяти CUDA
+    в момент вызова (уже после torch.cuda.synchronize()).
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    tag = tag.replace(" ", "_")
+    fn_base = f"cuda_mem_{ts}_{tag}" if tag else f"cuda_mem_{ts}"
+
+    # Краткая сводка
+    with open(f"{fn_base}_summary.txt", "w") as f:
+        f.write(torch.cuda.memory_summary())
+
+    # Детальная статистика
+    stats = torch.cuda.memory_stats()
+    with open(f"{fn_base}_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+
+    # Полный snapshot (много строк, но бесценен при расследовании)
+    snap = torch.cuda.memory_snapshot()
+    with open(f"{fn_base}_snapshot.json", "w") as f:
+        json.dump(snap, f)
+
+    print(f"[OOM-DEBUG] CUDA state saved to {fn_base}_*.txt/json")
 
 def cosine_learning_rate_with_warmup(optimizer, epoch, warmup_epochs, max_epochs, 
                                     init_lr, min_lr, warmup_start_lr=1e-6):
@@ -259,6 +281,10 @@ def train_epoch_improved(model, train_loader, criterion, optimizer, scaler, devi
                     continue
                     
             except RuntimeError as e:
+                if "out of memory" in str(e):
+                    logger.error(f"OOM at epoch {epoch} batch {batch_idx}")
+                    torch.cuda.synchronize()
+                    dump_cuda_state(tag=f"ep{epoch}_b{batch_idx}")
                 logger.error(f"Error during forward pass at batch {batch_idx}: {e}")
                 torch.cuda.empty_cache()
                 batch_idx += 1
@@ -296,6 +322,9 @@ def train_epoch_improved(model, train_loader, criterion, optimizer, scaler, devi
                         scaler.step(optimizer)
                         scaler.update()
                     except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            torch.cuda.synchronize()
+                            dump_cuda_state(tag=f"ep{epoch}_b{batch_idx}")
                         logger.error(f"Error during optimizer step at batch {batch_idx}: {e}")
                         # Сбрасываем скейлер, если возникла проблема
                         scaler._scale = torch.tensor(1.0, device=device)
@@ -317,8 +346,12 @@ def train_epoch_improved(model, train_loader, criterion, optimizer, scaler, devi
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     
                     optimizer.step()
-            
+
             except RuntimeError as e:
+                if "out of memory" in str(e):
+                        logger.error(f"OOM at epoch {epoch} batch {batch_idx}")
+                        torch.cuda.synchronize()
+                        dump_cuda_state(tag=f"ep{epoch}_b{batch_idx}")
                 logger.error(f"Error during backward pass at batch {batch_idx}: {e}")
                 torch.cuda.empty_cache()
                 batch_idx += 1
@@ -370,6 +403,10 @@ def train_epoch_improved(model, train_loader, criterion, optimizer, scaler, devi
             batch = prefetcher.next()
                 
         except Exception as e:
+            if "out of memory" in str(e):
+                logger.error(f"OOM at epoch {epoch} batch {batch_idx}")
+                torch.cuda.synchronize()
+                dump_cuda_state(tag=f"ep{epoch}_b{batch_idx}")
             logger.error(f"Unexpected error at batch {batch_idx}: {e}")
             import traceback
             traceback.print_exc()

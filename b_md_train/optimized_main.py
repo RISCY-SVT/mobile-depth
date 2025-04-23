@@ -18,8 +18,10 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
 
 
 def main():
-    torch.backends.cudnn.benchmark = False  # Выключаем benchmark для более предсказуемого поведения
-    torch.backends.cudnn.deterministic = True  # Включаем детерминированные алгоритмы
+    torch.backends.cudnn.benchmark = False      # Выключаем benchmark для более предсказуемого поведения
+    torch.backends.cudnn.deterministic = True   # Включаем детерминированные алгоритмы
+    torch.cuda.empty_cache()                    # Очищаем кэш CUDA для предотвращения утечек памяти
+    torch.cuda.reset_peak_memory_stats()        # Сбрасываем статистику пикового использования памяти
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Optimized training for B_MobileDepth model on MidAir dataset')
@@ -104,9 +106,6 @@ def main():
                       help='Enable profiling')
     
     args = parser.parse_args()
-    
-    # Установка параметров для лучшей производительности и стабильности
-    torch.backends.cudnn.benchmark = True
     
     # Print system information
     print("\n=== System Information ===")

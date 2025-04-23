@@ -165,137 +165,171 @@ class SmoothnessLoss(nn.Module):
         
         return (smoothness_x + smoothness_y) * self.weight
 
+# ─── improved_ssim.py ───────────────────────────────────────────────────────────
 class SSIM(nn.Module):
+    r"""
+    Memory–friendly SSIM with optional spatial down‑scaling.
+
+    Args:
+        window_size (int): gaussian window size (odd). Default: 7
+        downscale_factor (int): spatial down‑scale before SSIM. Default: 2
+        C1, C2 (float): stabilisation constants (squared, as in original paper)
     """
-    Улучшенное структурное сходство (SSIM) с механизмами стабилизации
-    для оценки визуального качества карты глубины и устойчивости к квантизации.
-    """
-    def __init__(self, window_size=7, size_average=True, C1=0.01, C2=0.03):
-        super(SSIM, self).__init__()
-        self.window_size = window_size
-        self.size_average = size_average
-        self.channel = 1
-        self.window = self._create_window(window_size, self.channel)
-        # Увеличенные константы для стабильности при квантизации
-        self.C1 = C1**2
-        self.C2 = C2**2
-        
-    def _create_window(self, window_size, channel):
-        _1D_window = self._gaussian(window_size, 1.5).unsqueeze(1)
-        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-        window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
-        return window
-        
-    def _gaussian(self, window_size, sigma):
-        # Создаем тензор с координатами
-        coords = torch.arange(window_size, dtype=torch.float)
-        # Вычисляем центр окна
-        center = window_size // 2
-        # Вычисляем квадрат расстояния от центра (преобразовано в тензор)
-        sq_diff = (coords - center) ** 2
-        # Вычисляем гауссову функцию на тензоре
-        gauss = torch.exp(-sq_diff / (2 * sigma ** 2))
-        # Нормализуем
-        return gauss / gauss.sum()
-    
+    def __init__(self,
+                 window_size: int = 7,
+                 downscale_factor: int = 2,
+                 C1: float = 0.01,
+                 C2: float = 0.03) -> None:
+        super().__init__()
+        assert window_size % 2 == 1, "window_size must be odd"
+
+        self.w = window_size
+        self.sigma = 1.5
+        self.downscale = max(1, downscale_factor)
+
+        # C1, C2 (already squared – стабилизация)
+        self.C1 = C1 ** 2
+        self.C2 = C2 ** 2
+
+        # кешируем 1‑D гаусс‑kernel в float32 (потом кастуем под входной dtype)
+        _1d = torch.arange(self.w, dtype=torch.float32) - (self.w - 1) / 2
+        g = torch.exp(-(_1d ** 2) / (2 * self.sigma ** 2))
+        g = (g / g.sum()).unsqueeze(1)                               # (w,1)
+        window_2d = g @ g.t()                                        # (w,w)
+        self.register_buffer("_window_base",
+                             window_2d.unsqueeze(0).unsqueeze(0))    # (1,1,w,w)
+
+    # --------------------------------------------------------------------- utils
+    @staticmethod
+    def _avg_pool(x, k):
+        """cheap down‑scale (anti‑alias)"""
+        if k == 1:
+            return x
+        return F.avg_pool2d(x, kernel_size=k, stride=k, padding=0, ceil_mode=False)
+
+    # ------------------------------------------------------------------ forward
     def forward(self, pred, target):
-        # Перемещаем окно на то же устройство, что и входные данные
-        if not hasattr(self, 'window') or self.window.device != pred.device:
-            self.window = self._create_window(self.window_size, self.channel).to(pred.device)
-        
-        # Cтабилизация входных данных для квантизации
-        pred = torch.clamp(pred, 0.001, 0.999)
-        target = torch.clamp(target, 0.001, 0.999)
-        
-        mu1 = F.conv2d(pred, self.window, padding=self.window_size//2, groups=self.channel)
-        mu2 = F.conv2d(target, self.window, padding=self.window_size//2, groups=self.channel)
-        
-        mu1_sq = mu1.pow(2)
-        mu2_sq = mu2.pow(2)
-        mu1_mu2 = mu1 * mu2
-        
-        sigma1_sq = F.conv2d(pred * pred, self.window, padding=self.window_size//2, groups=self.channel) - mu1_sq
-        sigma2_sq = F.conv2d(target * target, self.window, padding=self.window_size//2, groups=self.channel) - mu2_sq
-        sigma12 = F.conv2d(pred * target, self.window, padding=self.window_size//2, groups=self.channel) - mu1_mu2
-        
-        # Дополнительная стабилизация числителя и знаменателя
-        numer = (2 * mu1_mu2 + self.C1) * (2 * sigma12 + self.C2)
-        denom = (mu1_sq + mu2_sq + self.C1) * (sigma1_sq + sigma2_sq + self.C2)
-        
-        # Cтабилизация для избежания деления на очень маленькие числа
-        ssim_map = numer / (denom + 1e-8)
-        
-        if self.size_average:
-            return 1 - ssim_map.mean()
-        else:
-            return 1 - ssim_map.mean([1, 2, 3])
+        """
+        pred, target : (N,1,H,W) – dtype can be fp32 / fp16
+        returns      : loss = 1‑SSIM ∈ [0, 1]
+        """
+
+        # 1) optional spatial down‑scaling  -------------------------------
+        if self.downscale > 1:
+            pred = self._avg_pool(pred, self.downscale)
+            target = self._avg_pool(target, self.downscale)
+
+        # 2) get / cast window to correct device & dtype -------------------
+        if (not hasattr(self, "_window") or
+            self._window.device  != pred.device or
+            self._window.dtype   != pred.dtype):
+            self._window = self._window_base.to(device=pred.device,
+                                                dtype=pred.dtype)
+
+        # 3) pad so that output tensor has the same spatial size
+        pad = self.w // 2
+
+        mu1 = F.conv2d(pred,    self._window, padding=pad, groups=1)
+        mu2 = F.conv2d(target,  self._window, padding=pad, groups=1)
+
+        mu1_sq      = mu1.pow(2)
+        mu2_sq      = mu2.pow(2)
+        mu1_mu2     = mu1 * mu2
+
+        sigma1_sq   = F.conv2d(pred * pred,       self._window, padding=pad) - mu1_sq
+        sigma2_sq   = F.conv2d(target * target,   self._window, padding=pad) - mu2_sq
+        sigma12     = F.conv2d(pred * target,     self._window, padding=pad) - mu1_mu2
+
+        ssim_map_num = (2 * mu1_mu2 + self.C1) * (2 * sigma12 + self.C2)
+        ssim_map_den = (mu1_sq + mu2_sq + self.C1) * (sigma1_sq + sigma2_sq + self.C2)
+
+        ssim_map = ssim_map_num / (ssim_map_den + 1e-12)
+
+        # loss = 1 - mean SSIM
+        return 1.0 - ssim_map.mean()
 
 class EdgeAwareLoss(nn.Module):
     """
-    Специальная потеря для сохранения границ объектов разной глубины,
-    критично для качественной квантизации.
+    Потеря для сохранения чётких границ глубины.
+    • ядра Собеля хранятся один раз в FP32 на CPU;
+    • при первом обращении под каждый (device, dtype) создаётся копия
+      и кладётся в кеш  ->  нет лишних копирований каждый batch;
+    • есть опциональный down-scale, помогающий снизить расход памяти.
     """
-    def __init__(self, weight=0.2, sobel_size=3):
-        super(EdgeAwareLoss, self).__init__()
+    def __init__(
+        self,
+        weight: float = 0.2,
+        edge_threshold: float = 0.05,
+        downscale_factor: int = 1,
+    ):
+        super().__init__()
         self.weight = weight
-        self.sobel_kernel_x = torch.FloatTensor([
-            [-1, 0, 1],
-            [-2, 0, 2],
-            [-1, 0, 1]
-        ]).unsqueeze(0).unsqueeze(0)
-        
-        self.sobel_kernel_y = torch.FloatTensor([
-            [-1, -2, -1],
-            [0, 0, 0],
-            [1, 2, 1]
-        ]).unsqueeze(0).unsqueeze(0)
-        
-    def forward(self, pred, target):
-        device = pred.device
-        
-        if not hasattr(self, 'sobel_kernel_x_device') or self.sobel_kernel_x_device.device != device:
-            self.sobel_kernel_x_device = self.sobel_kernel_x.to(device)
-            self.sobel_kernel_y_device = self.sobel_kernel_y.to(device)
-        
-        # Конвертация в edge maps с использованием оператора Собеля
-        edge_x_pred = F.conv2d(pred, self.sobel_kernel_x_device, padding=1)
-        edge_y_pred = F.conv2d(pred, self.sobel_kernel_y_device, padding=1)
-        
-        edge_x_target = F.conv2d(target, self.sobel_kernel_x_device, padding=1)
-        edge_y_target = F.conv2d(target, self.sobel_kernel_y_device, padding=1)
-        
-        # Magnitude градиентов
-        edge_pred = torch.sqrt(edge_x_pred**2 + edge_y_pred**2 + 1e-6)
-        edge_target = torch.sqrt(edge_x_target**2 + edge_y_target**2 + 1e-6)
-        
-        # Подчеркиваем потери на ярко выраженных границах
-        edge_mask = edge_target > 0.05
-        
-        # Если есть значимые края, расчитываем потери усиленные на краях
-        if torch.any(edge_mask):
-            # L1 ошибка на краях
-            edge_error = torch.abs(edge_pred[edge_mask] - edge_target[edge_mask]).mean()
-            
-            # Учитываем также направление градиента для более точного сохранения границ
-            if torch.any(edge_x_target != 0) and torch.any(edge_y_target != 0):
-                # Нормализованные векторы направлений
-                norm_x_pred = edge_x_pred / (edge_pred + 1e-7)
-                norm_y_pred = edge_y_pred / (edge_pred + 1e-7)
-                
-                norm_x_target = edge_x_target / (edge_target + 1e-7)
-                norm_y_target = edge_y_target / (edge_target + 1e-7)
-                
-                # Скалярное произведение для угла между векторами
-                dot_product = norm_x_pred * norm_x_target + norm_y_pred * norm_y_target
-                angle_error = 1 - torch.abs(dot_product[edge_mask]).mean()
-                
-                # Комбинированная edge-aware потеря
-                return (edge_error + angle_error * 0.5) * self.weight
-            
-            return edge_error * self.weight
-        
-        # Если нет значимых краев, возвращаем минимальную потерю
-        return torch.tensor(0.0, device=device)
+        self.edge_threshold = edge_threshold
+        self.downscale_factor = downscale_factor
+
+        # базовые (CPU, FP32) версии ядер: shape (1, 1, 3, 3)
+        kx = torch.tensor([[-1, 0, 1],
+                           [-2, 0, 2],
+                           [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        ky = torch.tensor([[-1, -2, -1],
+                           [ 0,  0,  0],
+                           [ 1,  2,  1]], dtype=torch.float32).view(1, 1, 3, 3)
+
+        # регистрируем как buffer'ы (но не делаем persistent, чтобы не мешали сохранению модели)
+        self.register_buffer("kx_base", kx, persistent=False)
+        self.register_buffer("ky_base", ky, persistent=False)
+
+        self._kernel_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+
+    # --------------------------------------------------------------------- #
+    # внутренний helper: вернуть (kx, ky) с тем же device и dtype, что ref
+    # --------------------------------------------------------------------- #
+    def _get_kernels(self, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (ref.device, ref.dtype)
+        if key not in self._kernel_cache:
+            self._kernel_cache[key] = (
+                self.kx_base.to(ref.device, ref.dtype, non_blocking=True),
+                self.ky_base.to(ref.device, ref.dtype, non_blocking=True),
+            )
+        return self._kernel_cache[key]
+
+    # --------------------------------------------------------------------- #
+    # forward
+    # --------------------------------------------------------------------- #
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # ↓ при необходимости понижаем разрешение, чтобы снизить пиковое потребление памяти
+        if self.downscale_factor > 1:
+            pred_ds   = F.avg_pool2d(pred,   self.downscale_factor, self.downscale_factor)
+            target_ds = F.avg_pool2d(target, self.downscale_factor, self.downscale_factor)
+        else:
+            pred_ds, target_ds = pred, target
+
+        kx, ky = self._get_kernels(pred_ds)          # ядра на нужном device + dtype
+
+        # градиенты
+        ex_p = F.conv2d(pred_ds,   kx, padding=1)
+        ey_p = F.conv2d(pred_ds,   ky, padding=1)
+        ex_t = F.conv2d(target_ds, kx, padding=1)
+        ey_t = F.conv2d(target_ds, ky, padding=1)
+
+        mag_p = torch.sqrt(ex_p.pow(2) + ey_p.pow(2) + 1e-6)
+        mag_t = torch.sqrt(ex_t.pow(2) + ey_t.pow(2) + 1e-6)
+
+        mask = mag_t > self.edge_threshold
+
+        if mask.any():
+            # ошибка по модулю
+            edge_err = F.l1_loss(mag_p[mask], mag_t[mask])
+
+            # ориентация (косинус угла между векторами градиента)
+            nx_p, ny_p = ex_p / (mag_p + 1e-7), ey_p / (mag_p + 1e-7)
+            nx_t, ny_t = ex_t / (mag_t + 1e-7), ey_t / (mag_t + 1e-7)
+            angle_err = 1 - torch.abs((nx_p * nx_t + ny_p * ny_t)[mask]).mean()
+
+            return (edge_err + 0.5 * angle_err) * self.weight
+
+        # если ярких границ нет — нулевая потеря
+        return pred_ds.new_tensor(0.0)
 
 class RobustLoss(nn.Module):
     """
@@ -314,8 +348,12 @@ class RobustLoss(nn.Module):
         self.l1_loss = nn.L1Loss(reduction='mean')
         self.berhu_loss = BerHuLoss(threshold=0.2)
         self.scale_invariant = ScaleInvariantLoss()
-        self.ssim_loss = SSIM(window_size=7)
-        self.edge_loss = EdgeAwareLoss(weight=1.0)
+        self.ssim_loss = SSIM(window_size=7, downscale_factor=2)
+        self.edge_loss = EdgeAwareLoss(
+                            weight=edge_weight,     # Вес для границ
+                            edge_threshold=0.05,    # Порог для границ
+                            downscale_factor=2,     # Уменьшаем разрешение для экономии памяти
+)
         
         # Создадим директорию для визуализаций
         self.vis_dir = None
@@ -462,7 +500,7 @@ class DepthWithSmoothnessLoss(nn.Module):
         
         # Используем более стабильные функции потерь
         self.l1_loss = nn.L1Loss(reduction='mean')
-        self.ssim_loss = SSIM(window_size=7, C1=0.01, C2=0.03)  # Увеличенные константы стабильности
+        self.ssim_loss = SSIM(window_size=7, downscale_factor=2, C1=0.01, C2=0.03)  # Увеличенные константы стабильности
         self.smoothness_loss = SmoothnessLoss(weight=1.0, edge_factor=10.0)
         self.gradient_loss = GradientLoss(weight=1.0, edge_threshold=0.05)
         

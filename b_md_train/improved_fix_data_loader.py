@@ -254,7 +254,7 @@ class EnhancedRAMCachedDataset(RAMCachedDataset):
 def create_improved_dataloader(dataset, batch_size, shuffle=True, pin_memory=True, num_workers=0, 
                            persistent_workers=False, drop_last=False, worker_init_fn=None,
                            prefetch_factor=2):
-    """
+    r"""
     Creates an optimized data loader with settings for best
     performance and stability when training models for quantization.
     
@@ -289,43 +289,59 @@ def create_improved_dataloader(dataset, batch_size, shuffle=True, pin_memory=Tru
     
     return loader
 
-
+# ─── qat_prefetcher.py ──────────────────────────────────────────────────────────
+# qat_prefetcher.py
 class QATPrefetcher:
     """
-    Prefetcher for more efficient data loading during QAT (Quantization-Aware Training).
-    Minimizes latency between GPU and CPU during data transfer.
+    Prefetcher без двойного GPU-буфера:
+    ─ читает следующий batch в  CPU-RAM;
+    ─ при  .next()   синхронно копирует  CPU→GPU  только этот batch;
+      на GPU одновременно живёт ровно один batch.
     """
-    def __init__(self, loader, device, stream=None):
-        self.loader = iter(loader)
+
+    def __init__(self,
+                 loader: torch.utils.data.DataLoader,
+                 device: torch.device | str = "cuda"):
+        self._base_loader = loader            # сохраняем для reset()
         self.device = device
-        self.stream = stream if stream is not None else torch.cuda.Stream()
-        self.next_batch = None
-        self._preload()
-    
-    def _preload(self):
+        self._loader_iter = iter(loader)      # собственный итератор
+        self._next_batch_cpu = None           # хранится в RAM
+        self._preload()                       # загружаем первый batch (CPU)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    def _preload(self) -> None:
+        """Читаем следующий batch в CPU-память (без копий на GPU)."""
         try:
-            self.next_batch = next(self.loader)
+            self._next_batch_cpu = next(self._loader_iter)
         except StopIteration:
-            self.next_batch = None
-            return
-        
-        with torch.cuda.stream(self.stream):
-            # Transfer data to GPU asynchronously
-            for k in self.next_batch:
-                if isinstance(self.next_batch[k], torch.Tensor):
-                    self.next_batch[k] = self.next_batch[k].to(
-                        self.device, non_blocking=True
-                    )
-    
-    def next(self):
-        """Get next batch of data"""
-        torch.cuda.current_stream().wait_stream(self.stream)
-        batch = self.next_batch
-        self._preload()
-        return batch
-    
-    def reset(self):
-        """Reset iterator"""
-        self.loader = iter(self.loader._dataloader)
-        self.next_batch = None
+            self._next_batch_cpu = None       # эпоха закончилась
+
+    # ──────────────────────────────────────────────────────────────────────────
+    def next(self) -> dict | None:
+        """
+        Возвращает dict c тенсорами **уже на GPU**.
+        На GPU к моменту return будет находиться **только** этот batch.
+        """
+        if self._next_batch_cpu is None:      # конец эпохи
+            return None
+
+        # 1) берём CPU-batch, запускаем асинхронную загрузку следующего
+        batch_cpu = self._next_batch_cpu
+        self._preload()                       # читает следующий batch (CPU)
+
+        # 2) копируем текущий batch на GPU (синхронно с compute-stream’ом)
+        batch_gpu = {}
+        for k, v in batch_cpu.items():
+            if torch.is_tensor(v):
+                batch_gpu[k] = v.to(self.device, non_blocking=True)
+            else:
+                batch_gpu[k] = v
+
+        return batch_gpu
+
+    # ──────────────────────────────────────────────────────────────────────────
+    def reset(self) -> None:
+        """Начать эпоху заново (нужен новый итератор DataLoader)."""
+        self._loader_iter = iter(self._base_loader)
+        self._next_batch_cpu = None
         self._preload()

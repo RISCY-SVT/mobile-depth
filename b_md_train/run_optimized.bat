@@ -2,14 +2,14 @@
 echo Running with B_MobileDepth optimized settings...
 
 :: Оптимизация CUDA
-set CUDA_LAUNCH_BLOCKING=0
+set CUDA_LAUNCH_BLOCKING=1
 set PYTORCH_NO_CUDA_MEMORY_CACHING=1
 set PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
 :: Размеры батча и потоков
-set BATCH_SIZE=8
-set NUM_WORKERS=8
-set PREFETCH_FACTOR=4
+set BATCH_SIZE=6
+set NUM_WORKERS=10
+set PREFETCH_FACTOR=2
 set EPOCHS=10
 
 :: Размер изображения 
@@ -31,10 +31,11 @@ python optimized_main.py ^
   --clip_grad 1.0 ^
   --min_lr 1e-6 ^
   --epochs %EPOCHS% ^
-  --strong_augmentation ^
-  --noise_augmentation ^
-  --perspective_augmentation ^
   --use_robust_loss ^
   --test_quantization
 
 echo Training complete! Press any key to exit.
+
+rem  --strong_augmentation ^
+rem  --noise_augmentation ^
+rem  --perspective_augmentation ^
