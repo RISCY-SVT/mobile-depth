@@ -7,8 +7,8 @@ set PYTORCH_NO_CUDA_MEMORY_CACHING=1
 set PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
 :: Размеры батча и потоков
-set BATCH_SIZE=6
-set NUM_WORKERS=10
+set BATCH_SIZE=8
+set NUM_WORKERS=4
 set PREFETCH_FACTOR=2
 set EPOCHS=10
 

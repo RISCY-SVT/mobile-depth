@@ -12,66 +12,74 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import psutil
 import gc
+import logging
+import weakref
+
+# Настройка логгера
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("DataLoader")
 
 class RAMCachedDataset(Dataset):
     """
-    Dataset with RAM caching for extremely fast data loading on machines with high RAM.
-    Optimized for systems with large memory but slower disk access.
+    Dataset с RAM-кешированием для быстрой загрузки данных на устройствах с большим объемом RAM.
+    Оптимизирован для систем с большим объемом памяти, но медленным доступом к диску.
     """
-    def __init__(self, root_dir, datasets, environments, image_size=640, is_train=True, 
+    def __init__(self, root_dir, datasets, environments, image_size=320, is_train=True, 
                  val_split=0.1, depth_scale=100.0, max_total_images=None, 
-                 max_imgs_per_trajectory=None, cache_size=20000, enable_cache=True,
+                 max_imgs_per_trajectory=None, cache_size=10000, enable_cache=True,
                  enable_augmentation=True, debug=False):
         """
-        Initialize the dataset with RAM caching capabilities.
+        Инициализация датасета с возможностью кеширования в RAM.
         
         Args:
-            root_dir: Root directory of the dataset
-            datasets: List of dataset types to include (e.g., ['Kite_training'])
-            environments: List of environments to include (e.g., ['sunny', 'foggy'])
-            image_size: Size to resize images to
-            is_train: Whether this is for training or validation
-            val_split: Fraction of data to use for validation
-            depth_scale: Scale factor for depth maps
-            max_total_images: Maximum number of images to use (for quick testing)
-            max_imgs_per_trajectory: Maximum images to use from each trajectory
-            cache_size: Maximum number of images to keep in RAM cache
-            enable_cache: Whether to enable the RAM cache
-            enable_augmentation: Whether to apply data augmentation
-            debug: Enable debug output
+            root_dir: Корневая директория датасета
+            datasets: Список типов датасетов для включения (напр., ['Kite_training'])
+            environments: Список сред для включения (напр., ['sunny', 'foggy'])
+            image_size: Размер изображений после ресайза
+            is_train: Является ли этот датасет тренировочным
+            val_split: Доля данных для валидации
+            depth_scale: Множитель для карт глубины
+            max_total_images: Максимальное количество изображений (для быстрого тестирования)
+            max_imgs_per_trajectory: Максимальное число изображений из каждой траектории
+            cache_size: Максимальный размер кеша в RAM
+            enable_cache: Включить ли кеширование в RAM
+            enable_augmentation: Включить ли аугментацию данных
+            debug: Включить отладочный вывод
         """
         self.root_dir = root_dir
-        self.image_size = image_size
+        self.image_size = min(image_size, 640)  # Ограничиваем максимальный размер для экономии памяти
         self.depth_scale = depth_scale
         self.enable_cache = enable_cache
-        self.enable_augmentation = enable_augmentation and is_train  # Only augment training data
+        self.enable_augmentation = enable_augmentation and is_train  # Аугментируем только тренировочные данные
         self.debug = debug
         self.is_train = is_train
         
-        # Set up RAM cache using OrderedDict for LRU behavior
-        self.cache_size = cache_size if enable_cache else 0
-        self.cache = {}
+        # Настройка RAM-кеша с использованием OrderedDict для LRU поведения
+        self.cache_size = min(cache_size, 20000) if enable_cache else 0  # Ограничиваем макс. размер кеша
+        self.cache = OrderedDict()
         self.cache_hits = 0
         self.cache_misses = 0
         self.last_cache_report_time = time.time()
         
-        # Track memory usage
+        # Мониторинг использования памяти
         self.memory_usage = []
+        self.last_memory_check = time.time()
+        self.memory_check_interval = 60  # секунд
         
-        # Initialize data paths
+        # Инициализация путей к данным
         self.rgb_files = []
         self.depth_files = []
         
-        # Track statistics
+        # Статистика
         self.trajectories_processed = 0
         self.start_time = time.time()
         
-        print(f"Initializing {'training' if is_train else 'validation'} dataset with RAM caching")
-        print(f"  - Cache size: {self.cache_size} images")
-        print(f"  - Image size: {image_size}x{image_size}")
-        print(f"  - Available system RAM: {psutil.virtual_memory().available / (1024**3):.1f} GB")
+        logger.info(f"Инициализация {'тренировочного' if is_train else 'валидационного'} датасета с RAM-кешированием")
+        logger.info(f"  - Размер кеша: {self.cache_size} изображений")
+        logger.info(f"  - Размер изображений: {image_size}x{image_size}")
+        logger.info(f"  - Доступная системная RAM: {psutil.virtual_memory().available / (1024**3):.1f} ГБ")
         
-        # Find all image pairs
+        # Поиск всех пар изображений
         total_pairs_found = 0
         trajectories_with_limits = defaultdict(int)
         
@@ -79,17 +87,17 @@ class RAMCachedDataset(Dataset):
             for env in environments:
                 env_path = os.path.join(root_dir, dataset, env)
                 if not os.path.exists(env_path):
-                    print(f"Skipping {env_path}: directory doesn't exist")
+                    logger.info(f"Пропускаем {env_path}: директория не существует")
                     continue
                 
                 color_dir = os.path.join(env_path, 'color_left')
                 depth_dir = os.path.join(env_path, 'depth')
                 
                 if not os.path.exists(color_dir) or not os.path.exists(depth_dir):
-                    print(f"Skipping {env_path}: missing color_left or depth directory")
+                    logger.info(f"Пропускаем {env_path}: отсутствуют директории color_left или depth")
                     continue
                 
-                print(f"Processing {dataset}/{env}")
+                logger.info(f"Обработка {dataset}/{env}")
                 
                 trajectory_pairs = 0
                 for trajectory_dir in os.listdir(color_dir):
@@ -99,16 +107,16 @@ class RAMCachedDataset(Dataset):
                     if not os.path.isdir(rgb_trajectory_path) or not os.path.exists(depth_trajectory_path):
                         continue
                     
-                    # Find all image files with different possible extensions
+                    # Поиск изображений с разными возможными расширениями
                     rgb_files = []
-                    for ext in ['*.jpg', '*.jpeg', '*.JPEG', '*.JPG']:
+                    for ext in ['*.jpg', '*.jpeg', '*.JPEG', '*.JPG', '*.png', '*.PNG']:
                         rgb_files.extend(glob.glob(os.path.join(rgb_trajectory_path, ext)))
                     
                     rgb_files = sorted(rgb_files)
                     
-                    # Apply trajectory image limit if specified
+                    # Применяем ограничение по количеству изображений из траектории
                     if max_imgs_per_trajectory and len(rgb_files) > max_imgs_per_trajectory:
-                        # Use evenly spaced samples throughout the trajectory
+                        # Используем равномерно распределенные сэмплы по всей траектории
                         indices = np.linspace(0, len(rgb_files)-1, max_imgs_per_trajectory, dtype=int)
                         rgb_files = [rgb_files[i] for i in indices]
                         trajectories_with_limits[trajectory_dir] = len(indices)
@@ -116,9 +124,16 @@ class RAMCachedDataset(Dataset):
                     pairs_in_trajectory = 0
                     for rgb_file in rgb_files:
                         file_id = os.path.splitext(os.path.basename(rgb_file))[0]
-                        depth_file = os.path.join(depth_trajectory_path, f"{file_id}.png")
                         
-                        if os.path.exists(depth_file):
+                        # Проверяем различные расширения для файлов глубины
+                        depth_file = None
+                        for ext in ['.png', '.PNG', '.exr', '.EXR']:
+                            temp_path = os.path.join(depth_trajectory_path, f"{file_id}{ext}")
+                            if os.path.exists(temp_path):
+                                depth_file = temp_path
+                                break
+                        
+                        if depth_file:
                             self.rgb_files.append(rgb_file)
                             self.depth_files.append(depth_file)
                             pairs_in_trajectory += 1
@@ -127,28 +142,28 @@ class RAMCachedDataset(Dataset):
                         trajectory_pairs += pairs_in_trajectory
                         self.trajectories_processed += 1
                         if self.debug:
-                            print(f"  Trajectory {trajectory_dir}: {pairs_in_trajectory} pairs")
+                            logger.info(f"  Траектория {trajectory_dir}: {pairs_in_trajectory} пар")
                 
                 total_pairs_found += trajectory_pairs
-                print(f"  Found {trajectory_pairs} pairs in {dataset}/{env}")
+                logger.info(f"  Найдено {trajectory_pairs} пар в {dataset}/{env}")
         
         if trajectories_with_limits:
-            print(f"Applied trajectory limits to {len(trajectories_with_limits)} trajectories")
+            logger.info(f"Применены ограничения к {len(trajectories_with_limits)} траекториям")
         
-        print(f"Total pairs found: {total_pairs_found}")
+        logger.info(f"Всего найдено пар: {total_pairs_found}")
         
-        # Apply global image limit if specified
+        # Применяем глобальное ограничение на количество изображений если указано
         if max_total_images and total_pairs_found > max_total_images:
-            random.seed(42)
+            random.seed(42)  # Для воспроизводимости
             indices = random.sample(range(total_pairs_found), max_total_images)
             self.rgb_files = [self.rgb_files[i] for i in indices]
             self.depth_files = [self.depth_files[i] for i in indices]
-            print(f"Randomly sampled {max_total_images} pairs from total of {total_pairs_found}")
+            logger.info(f"Случайно выбрано {max_total_images} пар из {total_pairs_found}")
         
-        # Split into train/val
+        # Разделение на train/val
         if total_pairs_found > 0:
             all_indices = list(range(len(self.rgb_files)))
-            random.seed(42)
+            random.seed(42)  # Для воспроизводимости
             random.shuffle(all_indices)
             
             split_idx = int(val_split * len(all_indices))
@@ -157,11 +172,11 @@ class RAMCachedDataset(Dataset):
             self.rgb_files = [self.rgb_files[i] for i in selected_indices]
             self.depth_files = [self.depth_files[i] for i in selected_indices]
             
-            print(f"{'Training' if is_train else 'Validation'} examples: {len(self.rgb_files)}")
+            logger.info(f"{'Тренировочных' if is_train else 'Валидационных'} примеров: {len(self.rgb_files)}")
         else:
-            print("WARNING: No valid image pairs found!")
+            logger.warning("ВНИМАНИЕ: Не найдено подходящих пар изображений!")
         
-        # Base transformations (always applied)
+        # Базовые трансформации (всегда применяются)
         self.rgb_transform_base = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
@@ -173,141 +188,200 @@ class RAMCachedDataset(Dataset):
             transforms.ToTensor()
         ])
         
-        # Data augmentation transformations (only applied during training)
+        # Трансформации для аугментации данных (только для тренировки)
         if self.enable_augmentation:
-            print("Data augmentation enabled")
+            logger.info("Аугментация данных включена")
         
-        # Initialize prefetch queue
-        self.prefetch_queue = queue.Queue(maxsize=100)
+        # Инициализация очереди для предзагрузки
+        self.prefetch_queue = queue.Queue(maxsize=50)  # Уменьшена максимальная очередь для уменьшения потребления памяти
         self.prefetch_idx = 0
         self.prefetch_running = False
         self.prefetch_thread = None
         
-        # Start prefetching if cache is enabled
+        # Запускаем предзагрузку если кеш включен
         if self.enable_cache and len(self.rgb_files) > 0:
             self._start_prefetching()
+        
+        # Регистрация финализатора для корректного завершения
+        self._finalizer = weakref.finalize(self, self._cleanup)
+    
+    def _cleanup(self):
+        """Гарантированная очистка ресурсов при удалении объекта"""
+        self.shutdown()
     
     def _start_prefetching(self):
-        """Start a background thread to prefetch and cache data"""
+        """Запуск фонового потока для предзагрузки и кеширования данных"""
         if self.prefetch_running:
             return
             
         self.prefetch_running = True
-        self.prefetch_thread = threading.Thread(target=self._prefetch_worker)
-        self.prefetch_thread.daemon = True
+        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
         self.prefetch_thread.start()
-        print("Started background prefetching thread")
+        logger.info("Запущен фоновый поток предзагрузки")
     
     def _prefetch_worker(self):
-        """Worker thread to prefetch data into RAM cache"""
-        print("Prefetch worker started")
+        """Рабочий поток для предзагрузки данных в RAM-кеш с адаптивным управлением ресурсами"""
+        logger.info("Поток предзагрузки запущен")
         try:
             indices = list(range(len(self.rgb_files)))
-            random.shuffle(indices)  # Prefetch in random order for better cache distribution
+            random.shuffle(indices)  # Загружаем в случайном порядке для лучшего распределения кеша
             
-            for idx in indices:
-                if not self.prefetch_running:
-                    break
-                    
-                # Skip if already in cache
-                if idx in self.cache:
+            while self.prefetch_running:
+                # Проверка использования памяти
+                mem_percent = psutil.virtual_memory().percent
+                
+                # Если памяти осталось мало, прекращаем кеширование новых данных
+                if mem_percent > 85:  # Критический уровень использования памяти
+                    logger.warning(f"Высокое использование RAM ({mem_percent}%) - приостановка кеширования")
+                    time.sleep(5)  # Ждем некоторое время перед следующей проверкой
                     continue
                 
-                # Check memory usage and clear cache if needed
+                # Проверяем размер кеша
                 if len(self.cache) >= self.cache_size:
-                    continue  # Let the LRU mechanism handle cache eviction
+                    # Можем очистить некоторые старые элементы, если кеш заполнен
+                    if len(self.cache) > self.cache_size + 100:
+                        # Удаляем 10% самых старых элементов
+                        to_remove = int(self.cache_size * 0.1)
+                        for _ in range(to_remove):
+                            if self.cache:
+                                self.cache.popitem(last=False)
+                    
+                    # Ждем какое-то время перед следующей попыткой
+                    time.sleep(0.5)
+                    continue
                 
-                # Load the data
-                try:
-                    rgb_path = self.rgb_files[idx]
-                    depth_path = self.depth_files[idx]
-                    
-                    # Load and preprocess RGB image
-                    rgb_image = Image.open(rgb_path).convert('RGB')
-                    rgb_tensor = self.rgb_transform_base(rgb_image)
-                    
-                    # Load and preprocess depth image
-                    depth_image = Image.open(depth_path)
-                    depth_tensor = self.depth_transform_base(depth_image)
-                    
-                    # Normalize depth
-                    # depth_tensor = torch.clamp(depth_tensor / self.depth_scale, 0, 1)
-                    # Alternative approach
-                    depth_min, depth_max = depth_tensor.min(), depth_tensor.max()
-                    depth_tensor = (depth_tensor - depth_min) / (depth_max - depth_min + 1e-8)  # [0,1] range
-                    
-                    # Ensure single-channel depth
-                    if depth_tensor.shape[0] > 1:
-                        depth_tensor = depth_tensor[0].unsqueeze(0)
-                    
-                    # Store in cache
-                    self.cache[idx] = (rgb_tensor, depth_tensor)
-                    
-                    # Track memory usage occasionally
-                    if random.random() < 0.01:  # 1% chance to measure memory
-                        self.memory_usage.append(psutil.virtual_memory().percent)
+                # Выбираем следующий индекс для кеширования
+                for idx in indices:
+                    if not self.prefetch_running:
+                        break
                         
-                        # Report cache stats periodically
+                    # Пропускаем если уже в кеше
+                    if idx in self.cache:
+                        continue
+                    
+                    # Загружаем данные
+                    try:
+                        rgb_path = self.rgb_files[idx]
+                        depth_path = self.depth_files[idx]
+                        
+                        # Проверка доступного размера памяти
+                        if psutil.virtual_memory().percent > 80:
+                            logger.warning("Высокое использование RAM - пауза в кешировании")
+                            break
+                        
+                        # Загрузка и предобработка RGB изображения
+                        with Image.open(rgb_path) as rgb_image:
+                            rgb_image = rgb_image.convert('RGB')
+                            rgb_tensor = self.rgb_transform_base(rgb_image)
+                        
+                        # Загрузка и предобработка изображения глубины
+                        with Image.open(depth_path) as depth_image:
+                            depth_tensor = self.depth_transform_base(depth_image)
+                        
+                        # Нормализация глубины
+                        depth_min, depth_max = depth_tensor.min(), depth_tensor.max()
+                        if depth_max > depth_min:  # Проверка для избежания деления на ноль
+                            depth_tensor = (depth_tensor - depth_min) / (depth_max - depth_min + 1e-8)
+                        
+                        # Защита от экстремальных значений
+                        depth_tensor = torch.clamp(depth_tensor, 0.001, 0.999)
+                        
+                        # Обеспечиваем одноканальную глубину
+                        if depth_tensor.shape[0] > 1:
+                            depth_tensor = depth_tensor[0].unsqueeze(0)
+                        
+                        # Сохраняем в кеше
+                        self.cache[idx] = (rgb_tensor, depth_tensor)
+                        
+                        # Отслеживаем использование памяти периодически
                         current_time = time.time()
-                        if current_time - self.last_cache_report_time > 60:  # Report every minute
-                            self._report_cache_stats()
-                            self.last_cache_report_time = current_time
+                        if current_time - self.last_memory_check > self.memory_check_interval:
+                            mem_usage = psutil.virtual_memory().percent
+                            self.memory_usage.append(mem_usage)
+                            self.last_memory_check = current_time
                             
-                except Exception as e:
-                    print(f"Error prefetching index {idx}: {e}")
-                    torch.cuda.empty_cache()
+                            # Отчет о статистике кеша периодически
+                            if current_time - self.last_cache_report_time > 60:  # Отчет каждую минуту
+                                self._report_cache_stats()
+                                self.last_cache_report_time = current_time
+                            
+                            # Защита от исчерпания памяти
+                            if mem_usage > 90:
+                                logger.warning(f"Критическое использование RAM: {mem_usage}% - очистка кеша")
+                                # Очищаем половину кеша
+                                items_to_clear = len(self.cache) // 2
+                                for _ in range(items_to_clear):
+                                    if self.cache:
+                                        self.cache.popitem(last=False)
+                                # Форсируем сборку мусора
+                                gc.collect()
+                                break
+                                
+                    except Exception as e:
+                        logger.error(f"Ошибка при кешировании индекса {idx}: {e}")
+                    
+                    # Освобождаем немного времени CPU
+                    time.sleep(0.001)
                 
-                # Free up some CPU time
-                time.sleep(0.001)
+                # Перемешиваем индексы после полного прохода
+                random.shuffle(indices)
         
         except Exception as e:
-            print(f"Prefetch worker exception: {e}")
+            logger.error(f"Исключение в потоке предзагрузки: {e}")
         
         finally:
             self.prefetch_running = False
+            logger.info("Поток предзагрузки остановлен")
     
     def _report_cache_stats(self):
-        """Report cache statistics"""
-        cache_size_mb = sum(t.element_size() * t.nelement() for pair in self.cache.values() for t in pair) / (1024**2)
-        total_requests = self.cache_hits + self.cache_misses
-        hit_rate = self.cache_hits / max(1, total_requests) * 100
-        
-        print(f"Cache stats: {len(self.cache)}/{self.cache_size} entries, {cache_size_mb:.1f} MB, "
-              f"Hit rate: {hit_rate:.1f}% ({self.cache_hits}/{total_requests})")
-        print(f"Memory usage: {psutil.virtual_memory().percent}%, "
-              f"Available: {psutil.virtual_memory().available / (1024**3):.1f} GB")
-        
-        # Reset counters
-        self.cache_hits = 0
-        self.cache_misses = 0
+        """Отчет о статистике кеша"""
+        try:
+            cache_size_mb = sum(t.element_size() * t.nelement() for pair in self.cache.values() for t in pair) / (1024**2)
+            total_requests = self.cache_hits + self.cache_misses
+            hit_rate = self.cache_hits / max(1, total_requests) * 100
+            
+            logger.info(f"Статистика кеша: {len(self.cache)}/{self.cache_size} элементов, {cache_size_mb:.1f} МБ, "
+                      f"Попадания: {hit_rate:.1f}% ({self.cache_hits}/{total_requests})")
+            logger.info(f"Использование памяти: {psutil.virtual_memory().percent}%, "
+                      f"Доступно: {psutil.virtual_memory().available / (1024**3):.1f} ГБ")
+            
+            # Сброс счетчиков
+            self.cache_hits = 0
+            self.cache_misses = 0
+        except Exception as e:
+            logger.error(f"Ошибка при создании отчета о кеше: {e}")
     
     def _apply_augmentation(self, rgb, depth):
-        """Apply data augmentation to the RGB and depth pair"""
+        """Применение аугментации к паре RGB и depth"""
         if not self.enable_augmentation:
             return rgb, depth
         
-        # Random horizontal flip (50% chance)
+        # Случайное отражение по горизонтали (50% вероятность)
         if random.random() > 0.5:
-            rgb = torch.flip(rgb, [2])  # Flip horizontally
-            depth = torch.flip(depth, [2])  # Flip horizontally
+            rgb = torch.flip(rgb, [2])  # Отражение по горизонтали
+            depth = torch.flip(depth, [2])  # Отражение по горизонтали
         
-        # Random brightness and contrast adjustment to RGB (30% chance)
+        # Случайное изменение яркости и контраста RGB (30% вероятность)
         if random.random() > 0.7:
-            brightness_factor = random.uniform(0.8, 1.2)
-            contrast_factor = random.uniform(0.8, 1.2)
-            
-            # Denormalize
-            means = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            stds = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            rgb_denorm = rgb * stds + means
-            
-            # Adjust brightness and contrast
-            rgb_denorm = torch.clamp(rgb_denorm * brightness_factor, 0, 1)
-            gray = rgb_denorm.mean(dim=0, keepdim=True)
-            rgb_denorm = torch.clamp((rgb_denorm - gray) * contrast_factor + gray, 0, 1)
-            
-            # Renormalize
-            rgb = (rgb_denorm - means) / stds
+            try:
+                # Применяем изменения к RGB
+                brightness_factor = random.uniform(0.8, 1.2)
+                contrast_factor = random.uniform(0.8, 1.2)
+                
+                # Денормализация
+                means = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                stds = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                rgb_denorm = rgb * stds + means
+                
+                # Изменение яркости и контраста
+                rgb_denorm = torch.clamp(rgb_denorm * brightness_factor, 0, 1)
+                gray = rgb_denorm.mean(dim=0, keepdim=True)
+                rgb_denorm = torch.clamp((rgb_denorm - gray) * contrast_factor + gray, 0, 1)
+                
+                # Ренормализация
+                rgb = (rgb_denorm - means) / stds
+            except Exception as e:
+                logger.warning(f"Ошибка при аугментации: {e}")
         
         return rgb, depth
     
@@ -315,71 +389,110 @@ class RAMCachedDataset(Dataset):
         return len(self.rgb_files)
     
     def __getitem__(self, idx):
-        # Try to get from cache first
+        """Получение элемента с оптимизацией кеширования и управления памятью"""
+        # Проверка наличия в кеше
         if self.enable_cache and idx in self.cache:
             self.cache_hits += 1
-            # Move the item to the end of the OrderedDict (most recently used)
-            rgb_tensor, depth_tensor = self.cache.pop(idx)
-            self.cache[idx] = (rgb_tensor, depth_tensor)
             
-            # Apply augmentation
+            # Перемещаем элемент в конец OrderedDict (недавно использованный)
+            try:
+                rgb_tensor, depth_tensor = self.cache[idx]
+                # Обновляем позицию в кеше (LRU стратегия)
+                self.cache.pop(idx)
+                self.cache[idx] = (rgb_tensor, depth_tensor)
+                
+                # Применяем аугментацию
+                if self.enable_augmentation:
+                    rgb_tensor, depth_tensor = self._apply_augmentation(rgb_tensor, depth_tensor)
+                    
+                return {
+                    'rgb': rgb_tensor,
+                    'depth': depth_tensor,
+                    'rgb_path': self.rgb_files[idx],
+                    'depth_path': self.depth_files[idx],
+                    'from_cache': True
+                }
+            except Exception as e:
+                logger.warning(f"Ошибка при получении из кеша индекса {idx}: {e}")
+                # Продолжаем, как будто это был промах в кеше
+                self.cache_misses += 1
+        else:
+            self.cache_misses += 1
+        
+        # Промах в кеше - загрузка с диска
+        try:
+            # Загрузка RGB изображения
+            rgb_path = self.rgb_files[idx]
+            with Image.open(rgb_path) as rgb_image:
+                rgb_image = rgb_image.convert('RGB')
+                rgb_tensor = self.rgb_transform_base(rgb_image)
+            
+            # Загрузка изображения глубины
+            depth_path = self.depth_files[idx]
+            with Image.open(depth_path) as depth_image:
+                depth_tensor = self.depth_transform_base(depth_image)
+            
+            # Нормализация глубины с защитой от нулевых значений
+            depth_min, depth_max = depth_tensor.min(), depth_tensor.max()
+            if depth_max > depth_min:  # Проверка для избежания деления на ноль
+                depth_tensor = (depth_tensor - depth_min) / (depth_max - depth_min + 1e-8)
+            
+            # Защита от экстремальных значений для лучшей квантизации
+            depth_tensor = torch.clamp(depth_tensor, 0.001, 0.999)
+            
+            # Обеспечиваем одноканальную глубину
+            if depth_tensor.shape[0] > 1:
+                depth_tensor = depth_tensor[0].unsqueeze(0)
+            
+            # Применяем аугментацию если включена
             if self.enable_augmentation:
                 rgb_tensor, depth_tensor = self._apply_augmentation(rgb_tensor, depth_tensor)
+            
+            # Добавляем в кеш если включен и память не перегружена
+            if self.enable_cache and psutil.virtual_memory().percent < 85:
+                # Если кеш полон, удаляем самый старый элемент (первый в OrderedDict)
+                if len(self.cache) >= self.cache_size:
+                    self.cache.popitem(last=False)
                 
+                # Добавляем текущий элемент в кеш
+                self.cache[idx] = (rgb_tensor.clone(), depth_tensor.clone())
+            
             return {
                 'rgb': rgb_tensor,
                 'depth': depth_tensor,
-                'rgb_path': self.rgb_files[idx],
-                'depth_path': self.depth_files[idx],
-                'from_cache': True
+                'rgb_path': rgb_path,
+                'depth_path': depth_path,
+                'from_cache': False
             }
         
-        # Cache miss - load from disk
-        self.cache_misses += 1
-        
-        # Load RGB image
-        rgb_path = self.rgb_files[idx]
-        rgb_image = Image.open(rgb_path).convert('RGB')
-        rgb_tensor = self.rgb_transform_base(rgb_image)
-        
-        # Load depth image
-        depth_path = self.depth_files[idx]
-        depth_image = Image.open(depth_path)
-        depth_tensor = self.depth_transform_base(depth_image)
-        
-        # Normalize depth с защитой от нулевых значений для лучшей квантизации
-        depth_min, depth_max = depth_tensor.min(), depth_tensor.max()
-        depth_tensor = (depth_tensor - depth_min) / (depth_max - depth_min + 1e-8)  # [0,1] range
-        depth_tensor = torch.clamp(depth_tensor, 0.001, 1.0)  # Предотвращаем нулевые значения
-        
-        # Ensure single-channel depth
-        if depth_tensor.shape[0] > 1:
-            depth_tensor = depth_tensor[0].unsqueeze(0)
-        
-        # Apply augmentation if enabled
-        if self.enable_augmentation:
-            rgb_tensor, depth_tensor = self._apply_augmentation(rgb_tensor, depth_tensor)
-        
-        # Add to cache if enabled
-        if self.enable_cache:
-            # If cache is full, remove the oldest item (first in OrderedDict)
-            if len(self.cache) >= self.cache_size:
-                self.cache.popitem()
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке данных для индекса {idx}: {e}")
             
-            # Add current item to cache
-            self.cache[idx] = (rgb_tensor.clone(), depth_tensor.clone())
-        
-        return {
-            'rgb': rgb_tensor,
-            'depth': depth_tensor,
-            'rgb_path': rgb_path,
-            'depth_path': depth_path,
-            'from_cache': False
-        }
+            # Возвращаем заглушки нулевых тензоров в случае ошибки
+            rgb_tensor = torch.zeros(3, self.image_size, self.image_size)
+            depth_tensor = torch.zeros(1, self.image_size, self.image_size)
+            
+            return {
+                'rgb': rgb_tensor,
+                'depth': depth_tensor,
+                'rgb_path': self.rgb_files[idx] if idx < len(self.rgb_files) else "unknown",
+                'depth_path': self.depth_files[idx] if idx < len(self.depth_files) else "unknown",
+                'from_cache': False,
+                'error': True
+            }
     
     def shutdown(self):
-        """Shutdown the prefetching thread"""
+        """Корректное завершение работы потока предзагрузки"""
+        logger.info("Завершение работы датасета...")
         self.prefetch_running = False
+        
         if self.prefetch_thread and self.prefetch_thread.is_alive():
             self.prefetch_thread.join(timeout=1.0)
+            logger.info("Поток предзагрузки успешно остановлен")
+            
         self._report_cache_stats()
+        
+        # Очистка кеша для освобождения памяти
+        self.cache.clear()
+        gc.collect()
+        logger.info("Датасет корректно завершил работу")
